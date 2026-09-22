@@ -153,7 +153,7 @@ Submission example:
 {"url":"https://www.instagram.com/reel/POST_ID/","language":"auto","model":"base","captions":true}
 ```
 
-A job ID is a server-generated 24-character hexadecimal string. For completed jobs, `result` contains `text`, `segments` (start/end seconds plus text), `language`, `source`, and `elapsed_seconds`. The measured duration includes retrieval/model loading/transcription, not time waiting in the queue. Sources distinguish creator captions, automatic captions, and the actual local Whisper model.
+A job ID is a server-generated 24-character hexadecimal string. For completed jobs, `result` contains `text`, `segments` (start/end seconds plus text), `language`, `source`, and `elapsed_seconds`. The measured duration includes retrieval/model loading/transcription, not time waiting in the queue. New audio results also include `cpu_threads`, `model_load_seconds`, and `transcribe_seconds`; four inference threads is the default unless configured otherwise. These extra fields are absent from subtitle-only and older results. Sources distinguish creator captions, automatic captions, and the actual local Whisper model.
 
 The REST API returns 400 for invalid inputs/hosts and some queue errors, 401 for missing/incorrect authentication, 403 for invalid origin/CSRF requests, 404 for missing jobs, 409 for downloading an unfinished transcript, 413 for oversized uploads, and 422 for schema validation errors. A valid job can later fail asynchronously; check its `status` and `error`, not just the submission's HTTP code. Upstream download errors are stored with the job.
 

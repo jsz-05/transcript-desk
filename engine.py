@@ -10,7 +10,16 @@ import time
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-os.environ.setdefault('OMP_NUM_THREADS', '2')
+def configured_cpu_threads():
+    """Bound inference concurrency without starting multiple simultaneous jobs."""
+    value = int(os.environ.get('TRANSCRIPT_CPU_THREADS', '4'))
+    if value < 1:
+        raise ValueError('TRANSCRIPT_CPU_THREADS must be a positive integer.')
+    return min(value, os.cpu_count() or 1)
+
+
+CPU_THREADS = configured_cpu_threads()
+os.environ['OMP_NUM_THREADS'] = str(CPU_THREADS)
 os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
 os.environ.setdefault('HF_HUB_DISABLE_TELEMETRY', '1')
 os.environ.setdefault('HF_HUB_DISABLE_XET', '1')
@@ -142,16 +151,22 @@ def transcribe(job, path):
     model_name = job['model'] + ('.en' if job['language'] == 'en' else '')
     store.update(job['id'], status='transcribing', message='Loading speech model (first use may download it)', progress=0)
     local_model = store.DATA / 'models' / model_name
-    model = WhisperModel(str(local_model) if (local_model / 'model.bin').exists() else model_name, device='cpu', compute_type='int8', cpu_threads=2, num_workers=1, download_root=str(store.DATA / 'models'))
+    load_started = time.monotonic()
+    model = WhisperModel(str(local_model) if (local_model / 'model.bin').exists() else model_name, device='cpu', compute_type='int8', cpu_threads=CPU_THREADS, num_workers=1, download_root=str(store.DATA / 'models'))
+    load_seconds = time.monotonic() - load_started
+    transcribe_started = time.monotonic()
     iterator, info = model.transcribe(str(path), language=None if job['language'] == 'auto' else job['language'], task='transcribe', beam_size=5, vad_filter=True, vad_parameters={'min_silence_duration_ms': 1000}, word_timestamps=False)
     segments = []
     store.update(job['id'], message='Transcribing speech')
     for segment in iterator:
         segments.append({'start': round(segment.start, 3), 'end': round(segment.end, 3), 'text': segment.text.strip()})
         store.update(job['id'], progress=min(99, 100 * segment.end / max(info.duration, 1)))
+    transcribe_seconds = time.monotonic() - transcribe_started
     del model
     gc.collect()
-    return {'segments': segments, 'language': info.language, 'source': f'Local Whisper {model_name}'}
+    return {'segments': segments, 'language': info.language, 'source': f'Local Whisper {model_name}',
+            'cpu_threads': CPU_THREADS, 'model_load_seconds': round(load_seconds, 2),
+            'transcribe_seconds': round(transcribe_seconds, 2)}
 
 def run(job_id):
     import psutil

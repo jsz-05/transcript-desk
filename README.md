@@ -22,7 +22,7 @@ YouTube subtitles OR yt-dlp download -> faster-whisper CPU INT8
 | Alternative | Base (UI label: Faster) |
 | Language | Automatically detected |
 | Subtitles | Enabled; creator captions, then automatic captions, then audio |
-| CPU inference | Two threads, one worker, below-normal Windows priority |
+| CPU inference | Four threads by default, one worker, below-normal Windows priority |
 | GPU | Not used |
 | Active work | One recording at a time, at most 20 pending/active jobs |
 | Limits | 300 MiB media, three-hour recording, six-hour processing timeout |
@@ -141,6 +141,24 @@ Start-Service TranscriptDesk
 
 To remove app startup, stop the service and run `./TranscriptDeskService.exe uninstall` from the repository. Restore your desired AC sleep timeout with `powercfg /change standby-timeout-ac MINUTES`. To stop private HTTPS forwarding separately, use `tailscale serve --https=443 off`. This does not erase transcripts or uninstall Tailscale.
 
+## CPU concurrency and model memory
+
+A [two-versus-four-thread comparison](docs/PERFORMANCE.md) on the original server reduced mean waiting by about 28% for both models on a 59-second clip.
+
+Speech inference defaults to **four threads**, bounded by the machine's logical CPU count. One recording runs at a time with below-normal process priority. Four inference threads is not a hard 50% CPU cap on an eight-thread CPU: decoding, VAD, library helper threads, physical cores and SMT scheduling affect actual usage.
+
+To choose another thread count for a foreground server, set the variable before starting it:
+
+```powershell
+$env:TRANSCRIPT_CPU_THREADS = '2'
+powershell -ExecutionPolicy Bypass -File .\Start-Local.ps1
+```
+
+For a Windows service, edit the `TRANSCRIPT_CPU_THREADS` value in the ignored root `TranscriptDeskService.xml`, then restart the service as administrator. The checked-in template sets it to 4 for new installations. Values must be positive integers; values above the machine's logical CPU count are clamped. This setting applies to both Base and Small. It does not change model selection or enable concurrent jobs. The worker sets its own OpenMP thread limit from the same setting, so an old `OMP_NUM_THREADS` value does not override it.
+
+The server launches a fresh child process per job. Only the selected model loads, only when audio transcription is needed. Subtitles do not load Whisper. The child releases its model and exits after finishing; Base and Small are never both intentionally resident. Downloaded models remain on disk. Windows may retain recently read files in reclaimable filesystem cache, which is different from a live model process.
+
+New audio results expose `cpu_threads`, `model_load_seconds`, and `transcribe_seconds` in their JSON. `elapsed_seconds` still measures the whole job including retrieval; the new speech timer includes decoding, language detection and VAD. Subtitle results do not have these model-specific fields. Keeping a model loaded could reduce repeated startup cost, but this implementation favors idle memory release; use measured loading time to decide whether a persistent worker would be worthwhile.
 ## Agent connections: MCP and HTTP
 
 See **[docs/MCP.md](docs/MCP.md)** for the full protocol, tool parameters, lifecycle, chunking, authentication, Codex configuration, and Python examples. See **[examples/transcribe.py](examples/transcribe.py)** for an executable HTTP client that submits a link, polls and writes the full raw transcript to stdout.
@@ -206,7 +224,7 @@ Start the app to generate a fresh password/token. Update clients and securely di
 
 Tests use an isolated temporary database and disable the worker; they do not download media or contact third-party sites. They cover authentication, CSRF/host checks, URL validation, caching, exports, transcript chunk reconstruction, caption overlap, and MCP tool discovery/lifecycle. Live site behavior is a separate integration check.
 
-Measured on the 2400GE with two inference threads: an 11-second sample took 24.94 seconds with Small and 9.23 seconds with Base. One Instagram clip took 55.55 seconds with Small and 28 seconds with Base. A YouTube caption fetch took 3.48 seconds. These are single-run end-to-end measurements, not guaranteed performance or a formal accuracy evaluation. Automated tests and these live tests passed on the original host; a clean-machine service install and off-network Mac access still need separate verification.
+Measured on the 2400GE with two inference threads: an 11-second sample took 24.94 seconds with Small and 9.23 seconds with Base. One Instagram clip took 55.55 seconds with Small and 28 seconds with Base. A YouTube caption fetch took 3.48 seconds. These are single-run end-to-end measurements, not guaranteed performance or a formal accuracy evaluation. Automated tests and these live tests passed on the original host. The owner also confirmed access from a Mac over Tailscale. A clean-machine service install still needs separate verification.
 
 Before updating, stop the service, back up data, inspect source/dependency changes, install updated requirements and run tests, then start the service and check local/private access. The generated service XML and all private data remain untracked. Inspect `git status` and `git diff --cached` before every push; never force-add ignored credentials, transcripts or models.
 

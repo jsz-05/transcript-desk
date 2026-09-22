@@ -13,6 +13,51 @@ import app
 import store
 from engine import caption_segments, srt, validate_url
 
+def test_thread_configuration(monkeypatch):
+    import engine
+    monkeypatch.setattr(engine.os, 'cpu_count', lambda: 8)
+    monkeypatch.delenv('TRANSCRIPT_CPU_THREADS', raising=False)
+    assert engine.configured_cpu_threads() == 4
+    monkeypatch.setenv('TRANSCRIPT_CPU_THREADS', '2')
+    assert engine.configured_cpu_threads() == 2
+    monkeypatch.setenv('TRANSCRIPT_CPU_THREADS', '32')
+    assert engine.configured_cpu_threads() == 8
+    for invalid in ('0', '-1', 'four'):
+        monkeypatch.setenv('TRANSCRIPT_CPU_THREADS', invalid)
+        with pytest.raises(ValueError):
+            engine.configured_cpu_threads()
+
+def test_transcription_uses_selected_model_and_configured_threads(monkeypatch):
+    import engine
+    import av
+    import faster_whisper
+    from types import SimpleNamespace
+    calls = []
+    class AudioContainer:
+        duration = av.time_base
+        streams = SimpleNamespace(audio=[True])
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+    class FakeModel:
+        def __init__(self, model, **options):
+            calls.append((model, options))
+        def transcribe(self, *args, **kwargs):
+            segment = SimpleNamespace(start=0, end=1, text=' Test speech. ')
+            return iter([segment]), SimpleNamespace(duration=1, language='en')
+    monkeypatch.setattr(av, 'open', lambda *a: AudioContainer())
+    monkeypatch.setattr(faster_whisper, 'WhisperModel', FakeModel)
+    monkeypatch.setattr(engine, 'CPU_THREADS', 4)
+    monkeypatch.setattr(engine.store, 'update', lambda *a, **kw: None)
+    result = engine.transcribe({'id': 'test', 'model': 'base', 'language': 'auto'}, 'test.wav')
+    assert len(calls) == 1
+    assert calls[0][0] == 'base'
+    assert calls[0][1]['cpu_threads'] == 4
+    assert calls[0][1]['num_workers'] == 1
+    assert result['cpu_threads'] == 4
+    assert result['model_load_seconds'] >= 0
+    assert result['transcribe_seconds'] >= 0
+    assert result['segments'][0]['text'] == 'Test speech.'
+
 @pytest.fixture(scope='module')
 def client():
     with TestClient(app.app) as client:

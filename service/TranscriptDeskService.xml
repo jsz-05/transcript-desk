@@ -1,7 +1,7 @@
 <service>
   <id>TranscriptDesk</id>
   <name>Transcript Desk</name>
-  <description>Private transcript web app and MCP server. Two inference threads, one job at a time.</description>
+  <description>Private transcript web app and MCP server. Four inference threads, one job at a time.</description>
   <executable>%BASE%\.venv\Scripts\python.exe</executable>
   <arguments>"%BASE%\app.py"</arguments>
   <workingdirectory>%BASE%</workingdirectory>
@@ -9,7 +9,8 @@
   <env name="HF_HOME" value="%BASE%\data\hf"/>
   <env name="HF_HUB_DISABLE_TELEMETRY" value="1"/>
   <env name="HF_HUB_DISABLE_XET" value="1"/>
-  <env name="OMP_NUM_THREADS" value="2"/>
+  <env name="TRANSCRIPT_CPU_THREADS" value="4"/>
+  <env name="OMP_NUM_THREADS" value="4"/>
   <env name="OPENBLAS_NUM_THREADS" value="1"/>
   <startmode>Automatic</startmode>
   <delayedAutoStart>true</delayedAutoStart>
