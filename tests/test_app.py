@@ -63,6 +63,31 @@ def client():
     with TestClient(app.app) as client:
         yield client
 
+def test_fast_base_reuses_resident_model_and_fast_decoding(monkeypatch):
+    import engine
+    import av
+    from types import SimpleNamespace
+    class AudioContainer:
+        duration = av.time_base
+        streams = SimpleNamespace(audio=[True])
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+    calls=[]
+    class Resident:
+        def transcribe(self, *args, **kwargs):
+            calls.append(kwargs)
+            return iter([SimpleNamespace(start=0,end=1,text='Hello.')]), SimpleNamespace(duration=1,language='en')
+    monkeypatch.setattr(av, 'open', lambda *args: AudioContainer())
+    monkeypatch.setattr(engine.store, 'update', lambda *args, **kwargs: None)
+    monkeypatch.setattr(engine, 'load_whisper_model', lambda *args: pytest.fail('Resident Base must be reused'))
+    resident=Resident()
+    for language in ('auto','en'):
+        result=engine.transcribe({'id':'test','model':'base-fast','language':language},'test.wav',resident)
+        assert result['model_resident'] and result['model_load_seconds']==0
+        assert result['source']=='Local Whisper Base fast'
+    assert all(c['beam_size']==1 and c['best_of']==1 for c in calls)
+    assert [c['language'] for c in calls]==[None,'en']
+
 def token():
     return (store.DATA / 'ACCESS.txt').read_text().split('Agent API token: ')[1].splitlines()[0]
 
@@ -109,7 +134,7 @@ def test_full_text_chunks_and_exports(client):
         if part['next_offset'] is None: break
         offset = part['next_offset']
     assert ''.join(parts) == text
-    assert client.get(f"/api/jobs/{job['id']}/download",headers=auth()).text == text
+    assert client.get(f"/api/jobs/{job['id']}/download",headers=auth()).text == store.format_output(result)
     assert '00:00:01,250 --> 00:00:02,500' in client.get(f"/api/jobs/{job['id']}/download?format=srt",headers=auth()).text
 
 def test_caption_overlap_preserves_nonoverlap():
@@ -142,7 +167,7 @@ def test_mcp_job_lifecycle_and_complete_chunks(client):
         return result.get('structuredContent') or json.loads(result['content'][0]['text'])
     queued = call('transcribe_url', {'url': 'https://www.instagram.com/p/TestClip123/'})
     assert queued['status'] == 'queued'
-    assert (queued['model'], queued['language'], queued['captions']) == ('small', 'auto', 1)
+    assert (queued['model'], queued['language'], queued['captions']) == ('base-fast', 'auto', 1)
     assert call('get_transcription_status', {'job_id': queued['id']})['status'] == 'queued'
     text = 'Full raw transcript. ' * 2000
     store.update(queued['id'], status='done', result=json.dumps({
@@ -158,3 +183,123 @@ def test_mcp_job_lifecycle_and_complete_chunks(client):
     cached = call('transcribe_url', {'url': 'https://www.instagram.com/p/TestClip123/'})
     assert cached['id'] == queued['id']
     assert cached['transcript']['next_offset'] is not None
+
+def test_model_control_and_language_validation(client):
+    assert client.get('/api/model').status_code == 401
+    assert client.post('/api/model', json={'enabled': False}).status_code == 401
+    paused = client.post('/api/model', headers=auth(), json={'enabled': False}).json()
+    assert paused['state'] == 'unloaded' and not paused['enabled']
+    assert not store.model_enabled()
+    from model_runtime import ModelRuntime
+    assert not ModelRuntime().enabled  # The preference survives a fresh runtime.
+    job = client.post('/api/jobs', headers=auth(), json={'url': 'https://www.instagram.com/p/PausedTest123/'}).json()
+    assert job['status'] == 'queued' and job['model'] == 'base-fast'
+    assert not app.get_transcription_status(job['id'])['processing_enabled']
+    assert client.post('/api/jobs', headers=auth(), json={'url': 'https://www.instagram.com/p/SpanishTest123/', 'language': 'es', 'model': 'sensevoice'}).status_code == 400
+    assert client.post('/api/jobs', headers=auth(), json={'url': 'https://www.instagram.com/p/SpanishTest123/', 'language': 'es', 'model': 'base'}).status_code == 202
+    client.post('/api/model', headers=auth(), json={'enabled': True})
+    assert store.model_enabled()
+
+def test_unload_waits_for_active_job(monkeypatch):
+    import asyncio
+    from model_runtime import ModelRuntime
+    from types import SimpleNamespace
+    async def check():
+        runtime = ModelRuntime()
+        finished, entered = asyncio.Event(), asyncio.Event()
+        class Process:
+            pid = 99999999
+            returncode = None
+            stdin = None
+            def kill(self): self.returncode = -1
+            async def wait(self): return self.returncode
+        process = Process()
+        async def drain(): pass
+        process.stdin = SimpleNamespace(write=lambda data: None, drain=drain)
+        runtime.process = process
+        async def read(timeout):
+            entered.set()
+            await finished.wait()
+            return {'finished': True}
+        runtime._read = read
+        task = asyncio.create_task(runtime.run_job('test'))
+        await entered.wait()
+        status = await runtime.set_enabled(False)
+        assert status['state'] == 'unloading' and status['busy']
+        assert process.returncode is None
+        finished.set()
+        assert await task
+        assert process.returncode == -1 and runtime.process is None
+        assert runtime.state == 'unloaded'
+        assert not await runtime.run_job('next')
+        await runtime.set_enabled(True)
+    asyncio.run(check())
+
+def test_delete_transcript_access_cache_and_active_job_protection(client):
+    url = 'https://www.instagram.com/p/DeleteTest123/'
+    job = store.create_job(url=url)
+    path = '/api/jobs/' + job['id']
+    assert client.delete(path).status_code == 401
+    assert client.delete(path, headers=auth()).status_code == 409
+    assert store.get_job(job['id'])['status'] == 'queued'
+    store.update(job['id'], status='transcribing')
+    assert client.delete(path, headers=auth()).status_code == 409
+    store.update(job['id'], status='done', result=json.dumps({'text':'Delete me', 'segments':[], 'language':'en', 'source':'test'}))
+    password = (store.DATA / 'ACCESS.txt').read_text().split('Website password: ')[1].splitlines()[0]
+    assert client.post('/api/login', json={'password':password}, headers={'x-transcript-request':'1'}).status_code == 200
+    assert client.delete(path).status_code == 403
+    assert client.delete(path, headers={'x-transcript-request':'1'}).json()['deleted']
+    assert client.get(path).status_code == 404
+    assert client.get(path+'/download').status_code == 404
+    assert client.delete(path, headers={'x-transcript-request':'1'}).status_code == 404
+    assert all(item['id'] != job['id'] for item in client.get('/api/jobs').json())
+    replacement = store.create_job(url=url)
+    assert replacement['id'] != job['id']  # Deleted results cannot be cache hits.
+    store.update(replacement['id'], status='error')
+    assert client.delete('/api/jobs/'+replacement['id'], headers=auth()).status_code == 200
+    client.post('/api/logout', headers={'x-transcript-request':'1'})
+
+def test_sensevoice_reprocesses_legacy_unformatted_cache():
+    import hashlib
+    url = 'https://www.instagram.com/p/LegacySenseTest/'
+    legacy = store.create_job(url=url, model='sensevoice')
+    old_key = hashlib.sha256(json.dumps([url, 'auto', 'sensevoice', True]).encode()).hexdigest()
+    with store.connect() as db:
+        db.execute("UPDATE jobs SET cache_key=?,status='done' WHERE id=?", (old_key, legacy['id']))
+    fresh = store.create_job(url=url, model='sensevoice')
+    assert fresh['id'] != legacy['id']
+    assert store.get_job(legacy['id'])['status'] == 'done'
+    assert store.create_job(url=url, model='sensevoice')['id'] == fresh['id']
+
+@pytest.mark.parametrize('captions', [True, False])
+def test_description_saved_for_caption_and_audio_results(client, monkeypatch, captions):
+    import engine, yt_dlp, io
+    description = 'Original description.\n\n#tag <script>literal text</script>'
+    class Downloader:
+        def __init__(self, options): self.options=options
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def extract_info(self, *args, **kwargs):
+            return {'title':'Description test','description':description,'duration':2,
+                    'subtitles':{'en':[{'ext':'vtt','url':'https://example.test/captions'}]}}
+        def urlopen(self, url): return io.BytesIO(b'WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nHello there.\n')
+        def add_progress_hook(self, hook): pass
+        def process_info(self, info):
+            Path(self.options['outtmpl'].replace('%(ext)s','wav')).write_bytes(b'test audio')
+    monkeypatch.setattr(yt_dlp, 'YoutubeDL', Downloader)
+    monkeypatch.setattr(engine, 'transcribe', lambda *a: {'segments':[{'start':0,'end':2,'text':'Hello there.'}], 'language':'en', 'source':'test model'})
+    job=store.create_job(url='https://www.youtube.com/watch?v=TestDesc123',captions=captions)
+    engine.run(job['id'])
+    result=client.get('/api/jobs/'+job['id'],headers=auth()).json()['result']
+    assert result['description']==description and result['description_status']=='available'
+    expected='Transcript:\n\nHello there.\n\nDescription:\n\n'+description
+    assert result['formatted_text']==expected
+    assert client.get('/api/jobs/'+job['id']+'/download',headers=auth()).text==expected
+    assert app.get_transcript(job['id'])['description']==description
+    assert app.get_transcript(job['id'])['text']=='Hello there.'
+    assert description not in client.get('/api/jobs/'+job['id']+'/download?format=srt',headers=auth()).text
+
+def test_description_missing_states():
+    assert 'uploaded file' in store.format_output({'text':'Hello','description':'','description_status':'not_applicable'})
+    assert 'No public description available.' in store.format_output({'text':'Hello','description':'','description_status':'unavailable'})
+    assert 'older transcript' in store.format_output({'text':'Hello'})

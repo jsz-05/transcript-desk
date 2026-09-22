@@ -27,6 +27,7 @@ def initialize():
           language TEXT, model TEXT, captions INTEGER, input_path TEXT,
           created REAL, updated REAL, result TEXT, error TEXT);
         CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, expires REAL);
+        CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         ''')
         db.execute("UPDATE jobs SET status='queued', message='Resuming after restart' WHERE status IN ('working','downloading','transcribing')")
     secret_path = DATA / 'auth.json'
@@ -71,7 +72,18 @@ def public_job(row, include_result=False):
     result = {k: v for k, v in row.items() if k not in ('input_path', 'cache_key', 'result')}
     if include_result:
         result['result'] = json.loads(row['result']) if row['result'] else None
+        if result['result'] is not None:
+            result['result']['formatted_text'] = format_output(result['result'])
     return result
+
+def format_output(result):
+    description = result.get('description')
+    if not description:
+        status = result.get('description_status', 'not_saved')
+        description = {'not_applicable': 'No description — uploaded file.',
+                       'unavailable': 'No public description available.',
+                       'not_saved': 'Description was not saved for this older transcript.'}.get(status, 'No public description available.')
+    return f"Transcript:\n\n{result['text']}\n\nDescription:\n\n{description}"
 
 def update(job_id, **values):
     permitted = {'status', 'progress', 'message', 'source', 'title', 'result', 'error', 'input_path'}
@@ -80,8 +92,22 @@ def update(job_id, **values):
     with connect() as db:
         db.execute('UPDATE jobs SET ' + ','.join(f'{k}=?' for k in values) + ' WHERE id=?', (*values.values(), job_id))
 
-def create_job(url='', title='', language='auto', model='small', captions=True, input_path=''):
-    cache = hashlib.sha256(json.dumps([url, language, model, captions]).encode()).hexdigest() if url else None
+def model_enabled():
+    with connect() as db:
+        row = db.execute("SELECT value FROM settings WHERE key='model_enabled'").fetchone()
+    return not row or row['value'] == 'true'
+
+def set_model_enabled(enabled):
+    with connect() as db:
+        db.execute("INSERT INTO settings(key,value) VALUES ('model_enabled',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", ('true' if enabled else 'false',))
+
+def create_job(url='', title='', language='auto', model='base-fast', captions=True, input_path=''):
+    cache_settings = [url, language, model, captions]
+    if model == 'sensevoice':
+        # Keep old transcripts visible, but don't return pre-fix unformatted
+        # results when the user requests a transcription after this update.
+        cache_settings.append('sensevoice-itn-v2')
+    cache = hashlib.sha256(json.dumps(cache_settings).encode()).hexdigest() if url else None
     now = time.time()
     with connect() as db:
         db.execute('BEGIN IMMEDIATE')

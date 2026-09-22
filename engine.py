@@ -98,6 +98,7 @@ def retrieve(job, directory):
         options['js_runtimes'] = {'node': {'path': node}}
     with yt_dlp.YoutubeDL(options) as ydl:
         info = ydl.extract_info(job['url'], download=False)
+        job['_description'] = info.get('description') or ''
         if info.get('_type') in ('playlist', 'multi_video'):
             raise ValueError('This link contains multiple videos. Upload the individual video instead.')
         store.update(job['id'], title=info.get('title') or job['url'])
@@ -140,22 +141,29 @@ def retrieve(job, directory):
             raise ValueError('The website did not return a downloadable video. Try uploading the file.')
         return None, media[0]
 
-def transcribe(job, path):
+def load_whisper_model(model_name):
+    from faster_whisper import WhisperModel
+    local_model = store.DATA / 'models' / model_name
+    return WhisperModel(str(local_model) if (local_model / 'model.bin').exists() else model_name,
+                        device='cpu', compute_type='int8', cpu_threads=CPU_THREADS,
+                        num_workers=1, download_root=str(store.DATA / 'models'))
+
+
+def transcribe(job, path, resident=None):
     import av
     with av.open(str(path)) as container:
         if container.duration and container.duration / av.time_base > 10800:
             raise ValueError('Use a recording up to three hours long.')
         if not container.streams.audio:
             raise ValueError('This file has no audio track.')
-    from faster_whisper import WhisperModel
-    model_name = job['model'] + ('.en' if job['language'] == 'en' else '')
-    store.update(job['id'], status='transcribing', message='Loading speech model (first use may download it)', progress=0)
-    local_model = store.DATA / 'models' / model_name
+    fast = job['model'] == 'base-fast'
+    model_name = 'base' if fast else job['model'] + ('.en' if job['language'] == 'en' else '')
+    store.update(job['id'], status='transcribing', message='Preparing speech model', progress=0)
     load_started = time.monotonic()
-    model = WhisperModel(str(local_model) if (local_model / 'model.bin').exists() else model_name, device='cpu', compute_type='int8', cpu_threads=CPU_THREADS, num_workers=1, download_root=str(store.DATA / 'models'))
-    load_seconds = time.monotonic() - load_started
+    model = resident if fast and resident is not None else load_whisper_model(model_name)
+    load_seconds = 0 if fast and resident is not None else time.monotonic() - load_started
     transcribe_started = time.monotonic()
-    iterator, info = model.transcribe(str(path), language=None if job['language'] == 'auto' else job['language'], task='transcribe', beam_size=5, vad_filter=True, vad_parameters={'min_silence_duration_ms': 1000}, word_timestamps=False)
+    iterator, info = model.transcribe(str(path), language=None if job['language'] == 'auto' else job['language'], task='transcribe', beam_size=1 if fast else 5, best_of=1 if fast else 5, vad_filter=True, vad_parameters={'min_silence_duration_ms': 1000}, word_timestamps=False)
     segments = []
     store.update(job['id'], message='Transcribing speech')
     for segment in iterator:
@@ -164,11 +172,12 @@ def transcribe(job, path):
     transcribe_seconds = time.monotonic() - transcribe_started
     del model
     gc.collect()
-    return {'segments': segments, 'language': info.language, 'source': f'Local Whisper {model_name}',
+    return {'segments': segments, 'language': info.language, 'source': 'Local Whisper Base fast' if fast else f'Local Whisper {model_name}',
+            'model_resident': fast and resident is not None, 'beam_size': 1 if fast else 5,
             'cpu_threads': CPU_THREADS, 'model_load_seconds': round(load_seconds, 2),
             'transcribe_seconds': round(transcribe_seconds, 2)}
 
-def run(job_id):
+def run(job_id, resident=None):
     import psutil
     try:
         psutil.Process().nice(psutil.BELOW_NORMAL_PRIORITY_CLASS if os.name == 'nt' else 5)
@@ -185,8 +194,20 @@ def run(job_id):
         else:
             result, media = None, Path(job['input_path'])
         if result is None:
-            result = transcribe(job, media)
+            if job['model'] == 'sensevoice':
+                from sensevoice import SenseVoice
+                load_started = time.monotonic()
+                speech_model = SenseVoice(CPU_THREADS)
+                load_seconds = time.monotonic() - load_started
+                result = speech_model.transcribe(job, media)
+                result['model_resident'] = False
+                result['model_load_seconds'] = round(load_seconds, 2)
+                del speech_model
+            else:
+                result = transcribe(job, media, resident)
         result['text'] = '\n'.join(s['text'] for s in result['segments'])
+        result['description'] = job.get('_description', '')
+        result['description_status'] = ('available' if result['description'] else 'unavailable') if job['url'] else 'not_applicable'
         result['elapsed_seconds'] = round(time.monotonic() - started, 2)
         store.update(job_id, status='done', progress=100, source=result['source'], result=json.dumps(result, ensure_ascii=False), message='Transcript ready')
     except Exception as exc:
@@ -205,4 +226,24 @@ def run(job_id):
         store.update(job_id, input_path='')
 
 if __name__ == '__main__':
-    run(sys.argv[1])
+    if sys.argv[1] == '--resident':
+        import psutil
+        psutil.Process().nice(psutil.BELOW_NORMAL_PRIORITY_CLASS if os.name == 'nt' else 5)
+        # Reserve stdout exclusively for the private parent/worker protocol.
+        protocol = sys.stdout
+        sys.stdout = sys.stderr
+        def reply(value):
+            protocol.write(json.dumps(value)+'\n')
+            protocol.flush()
+        try:
+            resident = load_whisper_model('base')
+            reply({'ready': True})
+        except Exception as exc:
+            reply({'error': str(exc)})
+            sys.exit(1)
+        for command in sys.stdin:
+            message = json.loads(command)
+            run(message['job_id'], resident)
+            reply({'job_id': message['job_id'], 'finished': True})
+    else:
+        run(sys.argv[1])

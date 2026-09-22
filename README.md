@@ -2,7 +2,9 @@
 
 A small, private transcription website and MCP server for a Windows home server. Paste a YouTube or Instagram URL, or upload audio/video, and get the full transcript. No summaries, rewriting, paid transcription API, or LLM service is involved.
 
-The server first tries existing subtitles. If none are usable, it downloads audio (or the available video) and transcribes locally with faster-whisper. The interface provides history, copying, TXT and SRT exports; the HTTP API also exports JSON. The browser and agents share the same durable queue and saved results.
+The server first tries existing subtitles. If none are usable, it downloads audio (or the available video) and transcribes locally with Whisper Base fast using faster-whisper INT8. The interface provides history, deletion of finished/failed jobs, copying, TXT and SRT exports; the HTTP API also exports JSON. The browser and agents share the same durable queue and saved results. Website output, Copy text and TXT exports use `Transcript:` and `Description:` sections. Descriptions are the original platform metadata retrieved with the video, not AI-generated summaries. Missing/private descriptions are marked unavailable; uploads have no platform description. SRT remains speech-only. JSON and MCP retain raw transcript text and expose the description separately.
+
+**Already have a running server?** Start with the [Mac quick-start and Codex handoff](docs/MAC-QUICKSTART.md). The Mac only needs client access, not another server installation. See [MCP/API details](docs/MCP.md) for agent behavior and authentication.
 
 ## Architecture and defaults
 
@@ -13,13 +15,13 @@ Tailscale Serve on the Windows server
        | HTTP on loopback, port 8765
 FastAPI + authentication + SQLite + MCP
        | one queued job at a time
-YouTube subtitles OR yt-dlp download -> faster-whisper CPU INT8
+Resident worker: YouTube subtitles OR yt-dlp -> Whisper Base fast CPU INT8
 ```
 
 | Setting | Default / behavior |
 | --- | --- |
-| Model | Small (UI label: More accurate) |
-| Alternative | Base (UI label: Faster) |
+| Model | Whisper Base fast INT8, kept loaded; beam size 1, best-of 1 |
+| Alternatives | Standard Whisper Base (beam 5), Small, SenseVoice |
 | Language | Automatically detected |
 | Subtitles | Enabled; creator captions, then automatic captions, then audio |
 | CPU inference | Four threads by default, one worker, below-normal Windows priority |
@@ -28,7 +30,7 @@ YouTube subtitles OR yt-dlp download -> faster-whisper CPU INT8
 | Limits | 300 MiB media, three-hour recording, six-hour processing timeout |
 | Agent access | Single shared bearer token; all authenticated users see the same jobs |
 
-Base and Small are the two model choices, not four combinations. Selecting English explicitly uses the corresponding `.en` model. Other languages and automatic detection use multilingual models. Translated subtitle tracks are skipped. Automatic subtitles and Whisper can mishear names, omit speech, or hallucinate; this app preserves the returned text rather than correcting it.
+SenseVoice uses its native punctuation and text normalization; no separate rewriting model runs. Its speed and recognition quality vary by recording, and Whisper Base can be a better choice for English reels and names. SenseVoice automatically detects English, Chinese, Cantonese, Japanese and Korean. The language selector sets the caption preference; SenseVoice audio recognition always detects the language. Base fast always uses multilingual Base, including when English is selected. Standard Base and Small use their `.en` variants when English is selected. Translated subtitle tracks are skipped. Speech recognition and automatic captions can make mistakes; the app preserves their returned text. SenseVoice SRT timestamps mark speech segments, not precise word alignment.
 
 Completed and in-progress URL requests with identical URL, model, language and subtitle settings reuse the same job. Change a setting to create a separate comparison. There is no forced-refresh button yet. File uploads always create a new job.
 
@@ -50,7 +52,7 @@ Tested host: Windows x64, Python 3.12, Ryzen 5 PRO 2400GE, 16 GB RAM. The Mac is
    powershell -ExecutionPolicy Bypass -File .\Setup.ps1
    ```
 
-   This creates `.venv`, installs pinned Python dependencies, initializes `data/`, downloads Base and Small models from Hugging Face, and downloads the official WinSW 2.12.0 service wrapper with a SHA-256 check. It creates the local service XML from the checked-in template. It does not install the service, change sleep settings, or publish a network endpoint. No administrator access is required for this step. The execution-policy override lasts only for this PowerShell process.
+   This creates `.venv`, installs pinned Python dependencies, initializes `data/`, downloads Whisper Base from Hugging Face, and downloads the official WinSW 2.12.0 service wrapper with a SHA-256 check. It creates the local service XML from the checked-in template. It does not install the service, change sleep settings, or publish a network endpoint. No administrator access is required for this step. The execution-policy override lasts only for this PowerShell process.
 
    If the `py` launcher is unavailable, specify Python directly:
 
@@ -58,7 +60,7 @@ Tested host: Windows x64, Python 3.12, Ryzen 5 PRO 2400GE, 16 GB RAM. The Mac is
    powershell -ExecutionPolicy Bypass -File .\Setup.ps1 -Python 'C:\Path\To\Python312\python.exe'
    ```
 
-   `-SkipModels` defers model downloads until first transcription. `-SkipServiceWrapper` omits the wrapper if using only foreground operation. Stop the running app before rerunning setup; database initialization requeues interrupted jobs.
+   `-SkipModels` defers the Base download until model loading. Optional Whisper models download on first use. To enable the optional SenseVoice backend on a new installation, run `.\.venv\Scripts\python.exe .\prepare_sensevoice.py`. `-SkipServiceWrapper` omits the wrapper if using only foreground operation. Stop the running app before rerunning setup; database initialization requeues interrupted jobs.
 
 4. Start locally:
 
@@ -154,18 +156,21 @@ $env:TRANSCRIPT_CPU_THREADS = '2'
 powershell -ExecutionPolicy Bypass -File .\Start-Local.ps1
 ```
 
-For a Windows service, edit the `TRANSCRIPT_CPU_THREADS` value in the ignored root `TranscriptDeskService.xml`, then restart the service as administrator. The checked-in template sets it to 4 for new installations. Values must be positive integers; values above the machine's logical CPU count are clamped. This setting applies to both Base and Small. It does not change model selection or enable concurrent jobs. The worker sets its own OpenMP thread limit from the same setting, so an old `OMP_NUM_THREADS` value does not override it.
+For a Windows service, edit the `TRANSCRIPT_CPU_THREADS` value in the ignored root `TranscriptDeskService.xml`, then restart the service as administrator. The checked-in template sets it to 4 for new installations. Values must be positive integers; values above the machine's logical CPU count are clamped. This setting applies to SenseVoice and both Whisper models. It does not change model selection or enable concurrent jobs. The worker sets its own OpenMP thread limit from the same setting, so an old `OMP_NUM_THREADS` value does not override it.
 
-The server launches a fresh child process per job. Only the selected model loads, only when audio transcription is needed. Subtitles do not load Whisper. The child releases its model and exits after finishing; Base and Small are never both intentionally resident. Downloaded models remain on disk. Windows may retain recently read files in reclaimable filesystem cache, which is different from a live model process.
+Whisper Base loads once when the app starts and stays in a separate worker process between jobs. It consumes RAM while idle but does not continuously transcribe or poll the microphone. Other model choices load only when selected and can temporarily use additional RAM alongside Base.
 
-New audio results expose `cpu_threads`, `model_load_seconds`, and `transcribe_seconds` in their JSON. `elapsed_seconds` still measures the whole job including retrieval; the new speech timer includes decoding, language detection and VAD. Subtitle results do not have these model-specific fields. Keeping a model loaded could reduce repeated startup cost, but this implementation favors idle memory release; use measured loading time to decide whether a persistent worker would be worthwhile.
+Use **Unload model** at the top of the website to pause new work and release the worker's memory. An active job finishes first. The website, saved transcripts and downloads remain available. New submissions stay queued, including subtitle requests. **Load model** reloads Whisper Base and resumes the queue. The app remembers this setting across restarts. Model files stay on disk; Windows may also retain reclaimable filesystem cache. Unloading terminates the worker, releasing any retained inference-library allocations too.
+
+Audio results expose `cpu_threads`, `model_load_seconds`, and `transcribe_seconds`. For resident Base fast, `model_load_seconds` is zero because startup occurred before the job, and `model_resident` is true. `elapsed_seconds` measures the job, excluding queue time. SenseVoice streams decoded audio through VAD with bounded segments to avoid holding an entire recording in RAM.
+
 ## Agent connections: MCP and HTTP
 
 See **[docs/MCP.md](docs/MCP.md)** for the full protocol, tool parameters, lifecycle, chunking, authentication, Codex configuration, and Python examples. See **[examples/transcribe.py](examples/transcribe.py)** for an executable HTTP client that submits a link, polls and writes the full raw transcript to stdout.
 
 The MCP endpoint is `https://YOUR-PC.YOUR-TAILNET.ts.net/mcp/` (keep the trailing slash). It uses Streamable HTTP and the Agent API token, not the website password. A client must be able to reach the private URL. Installing Tailscale on a Mac makes it reachable to local Mac software; it does not automatically provide network access to a cloud-hosted agent. No public/cloud bridge is installed by this repository.
 
-Current endpoint defaults are Small, language auto, subtitles enabled. REST clients can request Base. The MCP `transcribe_url` tool currently has no model parameter and always uses Small. Browser WebMCP tools use the browser's selected model and language; these are separate from the remote MCP server.
+Endpoint defaults are `base-fast`, language auto, subtitles enabled. REST clients can also request `base`, `small` or `sensevoice`. The MCP `transcribe_url` tool has no model parameter and uses Base fast. Browser WebMCP tools use the browser's selected model and language; these are separate from the remote MCP server.
 
 ## Files, storage and privacy
 
@@ -182,11 +187,11 @@ Current endpoint defaults are Small, language auto, subtitles enabled. REST clie
 | `data/logs/`, `data/worker.log` | Operational logs | No |
 | `.venv/`, service executable, `comparison/` | Dependencies and local test artifacts | No |
 
-The download prefers audio-only when available. The downloader checks the 300 MiB limit if the size is known and monitors downloaded bytes otherwise; it can exceed the boundary by a download chunk before aborting. Uploads are size-checked too. Transcripts persist; normal job completion/failure removes downloaded media and the server's upload copy. Your original source file is untouched. Forced termination or power failure can leave temporary files; no startup cleanup sweep is implemented. Logs and saved transcripts do not have automatic retention limits yet.
+The download prefers audio-only when available. The downloader checks the 300 MiB limit if the size is known and monitors downloaded bytes otherwise; it can exceed the boundary by a download chunk before aborting. Uploads are size-checked too. Transcripts are saved on the server until deleted. Right-click a finished or failed sidebar entry, choose Delete transcript, then confirm to permanently remove its history and saved text. Deleted URLs can be submitted again as new jobs; queued/running jobs cannot be deleted. Existing exported files and external backups are unaffected. Normal job completion/failure removes downloaded media and the server's upload copy. Your original source file is untouched. Forced termination or power failure can leave temporary files; no startup cleanup sweep is implemented. Logs and saved transcripts do not have automatic retention limits yet.
 
-Only one app process may access the job queue as a worker. Startup marks interrupted jobs queued, so do not import `app.py` against live production data from a second process or start two servers. Normal speech models unload between jobs. First-use downloads add time, particularly for an English-specific model that has not been downloaded yet.
+Only one app process may access the job queue as a worker. Startup marks interrupted jobs queued, so do not import `app.py` against live production data from a second process or start two servers. Whisper Base stays resident until unloaded from the website. First-use Whisper downloads add time.
 
-This is a single-user private-network utility, not an audited multi-tenant public service. Every valid API token/browser session has full access to this app's transcripts and queue. Site URLs are limited to HTTPS YouTube/Instagram individual posts/videos; creator login cookies are not imported. URLs still contact those platforms, and first-use model downloads contact Hugging Face. File transcription runs locally after model download. Private GitHub visibility does not replace credential exclusion.
+This is a single-user private-network utility, not an audited multi-tenant public service. Every valid API token/browser session has full access to this app's transcripts and queue. Site URLs are limited to HTTPS YouTube/Instagram individual posts/videos; creator login cookies are not imported. URLs still contact those platforms, and model downloads contact GitHub (SenseVoice/VAD) or Hugging Face (Whisper). File transcription runs locally after model download. Private GitHub visibility does not replace credential exclusion.
 
 ### Backups, recovery and credential rotation
 
@@ -212,7 +217,7 @@ Start the app to generate a fresh password/token. Update clients and securely di
 | MCP OAuth prompt | This server uses a configured bearer token, not OAuth discovery/login |
 | Codex says token variable missing | Fully restart the client with that environment variable available to its process |
 | Instagram/YouTube blocked | Platform may require login or rate-limit; upload a saved file you can access |
-| First transcription is slow | Model may be downloading; subsequent jobs still load the model each time |
+| Model unavailable / queued jobs paused | Check the model panel, check model download errors in the worker log, then click Load model |
 | Service cannot read Python/Node | Check install path and LocalService permissions; use a normal all-users runtime |
 | Port 8765 already occupied | Stop the existing instance; do not run foreground and service simultaneously |
 
@@ -224,7 +229,7 @@ Start the app to generate a fresh password/token. Update clients and securely di
 
 Tests use an isolated temporary database and disable the worker; they do not download media or contact third-party sites. They cover authentication, CSRF/host checks, URL validation, caching, exports, transcript chunk reconstruction, caption overlap, and MCP tool discovery/lifecycle. Live site behavior is a separate integration check.
 
-Measured on the 2400GE with two inference threads: an 11-second sample took 24.94 seconds with Small and 9.23 seconds with Base. One Instagram clip took 55.55 seconds with Small and 28 seconds with Base. A YouTube caption fetch took 3.48 seconds. These are single-run end-to-end measurements, not guaranteed performance or a formal accuracy evaluation. Automated tests and these live tests passed on the original host. The owner also confirmed access from a Mac over Tailscale. A clean-machine service install still needs separate verification.
+Historical Whisper measurements on the 2400GE with two inference threads: an 11-second sample took 24.94 seconds with Small and 9.23 seconds with Base. One Instagram clip took 55.55 seconds with Small and 28 seconds with Base. A YouTube caption fetch took 3.48 seconds. These are single-run end-to-end measurements, not guaranteed performance or a formal accuracy evaluation. Automated tests and these live tests passed on the original host. The owner also confirmed access from a Mac over Tailscale. A clean-machine service install still needs separate verification.
 
 Before updating, stop the service, back up data, inspect source/dependency changes, install updated requirements and run tests, then start the service and check local/private access. The generated service XML and all private data remain untracked. Inspect `git status` and `git diff --cached` before every push; never force-add ignored credentials, transcripts or models.
 
@@ -232,6 +237,8 @@ Before updating, stop the service, back up data, inspect source/dependency chang
 
 - [Tailscale Serve](https://tailscale.com/docs/features/tailscale-serve)
 - [Tailscale Mac installation](https://tailscale.com/docs/install/mac)
+- [SenseVoice](https://github.com/FunAudioLLM/SenseVoice)
+- [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)
 - [faster-whisper](https://github.com/SYSTRAN/faster-whisper)
 - [yt-dlp](https://github.com/yt-dlp/yt-dlp)
 - [WinSW 2.12.0](https://github.com/winsw/winsw/releases/tag/v2.12.0)

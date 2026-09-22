@@ -18,7 +18,7 @@ class NoRedirect(HTTPRedirectHandler):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('url', help='YouTube or Instagram video URL')
-    parser.add_argument('--model', choices=('base', 'small'), default='small')
+    parser.add_argument('--model', choices=('base-fast', 'sensevoice', 'base', 'small'), default='base-fast')
     parser.add_argument('--language', default='auto')
     parser.add_argument('--no-subtitles', action='store_true')
     args = parser.parse_args()
@@ -46,7 +46,7 @@ def main():
     while time.monotonic() < deadline:
         job = request('/api/jobs/' + job['id'])
         if job['status'] == 'done':
-            print(job['result']['text'])
+            print(job['result'].get('formatted_text', job['result']['text']))
             return
         if job['status'] == 'error':
             raise RuntimeError(job.get('error') or 'Transcription failed')

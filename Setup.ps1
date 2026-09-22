@@ -23,8 +23,8 @@ try {
     & $venvPython -c 'import store; store.initialize()'
     if ($LASTEXITCODE -ne 0) { throw 'Could not initialize app data.' }
     if (-not $SkipModels) {
-        & $venvPython -c "from faster_whisper.utils import download_model; import store; [download_model(m, output_dir=str(store.DATA / 'models' / m)) for m in ('base', 'small')]"
-        if ($LASTEXITCODE -ne 0) { throw 'Model download failed. Retry setup or use -SkipModels for download on first use.' }
+        & $venvPython -c "from faster_whisper.utils import download_model; import store; download_model('base', output_dir=str(store.DATA / 'models' / 'base'))"
+        if ($LASTEXITCODE -ne 0) { throw 'Model download failed. Retry setup before loading the model.' }
     }
 } finally { Pop-Location }
 if (-not $SkipServiceWrapper) {
